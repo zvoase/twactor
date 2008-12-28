@@ -231,21 +231,21 @@ class UserProfile(Cached):
         super(UserProfile, self).__init__()
         self.user = user
     
-    @property
-    def _cache(self):
+    def _get_cache(self):
         return self.user._cache
     
-    @_cache.setter
-    def _cache(self, value):
+    def _set_cache(self, value):
         self.user._cache = value
     
-    @property
-    def _updated(self):
+    _cache = property(_get_cache, _set_cache)
+    
+    def _get_updated(self):
         return self.user._updated
     
-    @_updated.setter
-    def _updated(self, value):
+    def _set_updated(self, value):
         self.user._updated = value
+    
+    _updated = property(_get_updated, _set_updated) 
     
     def _update_cache(self):
         return self.user._update_cache()
