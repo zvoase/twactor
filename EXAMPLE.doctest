@@ -1,0 +1,14 @@
+>>> import twactor
+>>> user = twactor.User('username')
+>>> user.username
+u'username'
+>>> user.joined
+datetime.datetime(...)
+>>> feed = user.feed
+>>> status = feed[0]
+>>> status.text
+u'Some text here.'
+>>> status.created
+datetime.datetime(...)
+>>> status.user
+<twactor.User(u'username')>
