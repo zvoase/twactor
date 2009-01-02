@@ -1,6 +1,9 @@
+# -*- coding: utf-8 -*-
+
 import datetime
 import os
 import re
+import time
 
 import pytz
 try:
@@ -20,14 +23,11 @@ class User(cache.CachedObject):
     
     STATUS_UPDATE_INTERVAL = 3 * 60 # 3 minutes between each status update.
     
-    def __init__(self, username_or_id, cache={}):
-        super(User, self).__init__(cache=cache)
+    def __init__(self, username_or_id, *args, **kwargs):
         if isinstance(username_or_id, basestring):
-            self._screen_name = username_or_id.decode('utf-8')
-            self._identified_by = 'username'
-        elif isinstance(username_or_id, int):
-            self._id = username_or_id
-            self._identified_by = 'id'
+            self._cache['screen_name'] = username_or_id.decode('utf-8')
+        elif isinstance(username_or_id, (int, long)):
+            self._cache['id'] = username_or_id
         self.profile = UserProfile(self)
     
     def __eq__(self, user):
@@ -38,44 +38,30 @@ class User(cache.CachedObject):
         elif isinstance(user, UserProfile):
             return self == user.user
     
+    def __repr__(self):
+        return 'User(%r)' % (self._identifier,)
+    
+    @classmethod
+    def me(cls):
+        return cls(cls._connection_broker.username)
+        
     def _update_cache(self):
         logger = log.getLogger('twactor.User.update')
-        cb = connection.DEFAULT_CB
-        if self._identified_by == 'username':
-            path = '/users/show/%s.json' % (self.username,)
-            logger.debug('Updating cache for @%s...' % (self.username,))
-        elif self._identified_by == 'id':
-            path = '/users/show/%d.json' % (self.id,)
-            logger.debug('Updating cache for user %d...' % (self.id,))
+        logger.debug('Updating cache for user %s' % (self._identifier,))
         try:
-            data = cb.get(path)
+            data = self._connection_broker.get('/users/show/%s.json' % (
+                self._identifier,))
         except Exception, exc:
             # TODO: implement better error handling.
-            logger.error('Error fetching user info for %s.' % (self.username,))
+            logger.error('Error fetching user info for %s' % (
+                self._identifier,))
         else:
             self._cache = data
     
     @property
-    def id(self):
-        if self._identified_by == 'id':
-            return self._id
-        id = self._cache.get('id', None)
-        if id:
-            return id
-        else:
-            self._update_cache()
-            return self._cache['id']
-    
-    @property
-    def username(self):
-        if self._identified_by == 'username':
-            return self._screen_name
-        screen_name = self._cache.get('screen_name', None)
-        if screen_name:
-            return screen_name
-        else:
-            self._update_cache()
-            return self._cache['screen_name']
+    def _identifier(self):
+        return self._cache.get('screen_name',
+            self._cache.get('id', None) or '')
     
     @property
     @cache.update_on_time(STATUS_UPDATE_INTERVAL)
@@ -83,7 +69,8 @@ class User(cache.CachedObject):
         status_data = self._cache['status'].copy()
         status_data['user'] = self._cache.copy()
         status_data['user'].pop('status')
-        return Tweet(status_data['id'], cache=status_data)
+        return Tweet(status_data['id'], cache=status_data
+            )._with_connection_broker(self._connection_broker)
     
     @property
     @cache.update_on_key('created_at')
@@ -99,6 +86,8 @@ class User(cache.CachedObject):
         tzinfo.dst = lambda *args: datetime.timedelta()
         return (self._cache['time_zone'], tzinfo)
     
+    id = cache.simple_map('id')
+    username = cache.simple_map('screen_name')
     description = cache.simple_map('description')
     location = cache.simple_map('location')
     name = cache.simple_map('name')
@@ -112,12 +101,9 @@ class User(cache.CachedObject):
     _time_zone_utc_offset = cache.simple_map('utc_offset')
 
 
-class UserProfile(cache.CachedObject):
+class UserProfile(cache.CachedMirror):
     
-    def __init__(self, user):
-        # We do not call the parent class's __init__ because this is not a
-        # conventional cached object.
-        self.user = user
+    _mirrored_attribute = 'user'
     
     def __eq__(self, profile):
         if not isinstance(profile, (User, UserProfile)):
@@ -127,25 +113,8 @@ class UserProfile(cache.CachedObject):
         elif isinstance(profile, User):
             return profile == self.user
     
-    @cache.propertyfix
-    def _cache():
-        def fget(self):
-            return self.user._cache
-        def fset(self, value):
-            self.user._cache = value
-        return locals()
-    
-    @cache.propertyfix
-    def _updated():
-        def fget(self):
-            return self.user._updated
-        def fset(self, value):
-            self.user._updated = value
-        return locals()
-    
-    @property
-    def _update_cache(self):
-        return self.user._update_cache
+    def __repr__(self):
+        return 'UserProfile(%r)' % (self.user,)
     
     bg_color = cache.simple_map('profile_background_color')
     bg_image_url = cache.simple_map('profile_background_image_url')
@@ -157,81 +126,42 @@ class UserProfile(cache.CachedObject):
     text_color = cache.simple_map('profile_text_color')
 
 
-class UserFeed(object):
-    
-    def __init__(self, user):
-        super(UserFeed, self).__init__()
-        self.user = user
-        self._cache = []
-        self._cache_page = 0
-    
-    def __iter__(self):
-        pass # TODO: implement.
-    
-    def __len__(self):
-        return self.user._status_count
-    
-    def __getitem__(self, pos):
-        while len(self._cache) < (pos + 1):
-            self._extend_cache()
-        return Tweet(self._cache[pos]['id'], cache=self._cache[pos])
-    
-    def __getslice__(self, start, end):
-        assert (start >= 0 and end >= 0), 'Negative indices not allowed yet!'
-        i, slice = start, []
-        while i < (end or len(self)):
-            slice.append(self[i])
-            i += 1
-        return slice
-    
-    def _extend_cache(self):
-        logger = log.getLogger('twactor.UserFeed.update')
-        cb = connection.DEFAULT_CB
-        try:
-            if self.user._identified_by == self.user._USERNAME:
-                data = cb.get('/statuses/user_timeline/%s.json?page=%d' %
-                    (self.user.username, self._cache_page))
-            elif self.user._identified_by == self.user._ID:
-                data = cb.get('/statuses/user_timeline/%d.json?page=%d' %
-                    (self.user.id, self._cache_page))
-        except Exception, exc:
-            logger.error('Error retrieving statuses for user %s.' %
-                (self.user.username,))
-        else:
-            self._cache.extend(data)
-            self._cache_page += 1            
-
-
 class Tweet(cache.CachedObject):
-        
+    
     def __init__(self, id, *args, **kwargs):
-        super(Tweet, self).__init__(*args, **kwargs)
-        self._id = id
+        try:
+            id = int(id)
+        except TypeError:
+            pass
+        else:
+            self._cache['id'] = id
     
     def __eq__(self, tweet):
         if not isinstance(tweet, Tweet):
             return False
         return tweet.id == self.id
     
+    def __repr__(self):
+        return 'Tweet(%r)' % (self.id,)
+    
     def _update_cache(self):
         logger = log.getLogger('twactor.Tweet.update')
-        logger.debug('Updating cache for tweet %d...' % (self.id,))
-        cb = connection.DEFAULT_CB
+        logger.debug('Updating cache for tweet %d' % (self.id,))
         try:
-            data = cb.get('/statuses/show/%d.json' % (self.id,))
+            data = self._connection_broker.get(
+                '/statuses/show/%d.json' % (self.id,))
         except Exception, exc:
             # TODO: implement better error handling.
-            logger.error('Error fetching info for tweet ID %d.' % (self.id,))
+            logger.error('Error fetching info for tweet ID %d' % (self.id,))
         else:
             self._cache = data
-    
-    id = property(lambda self: self._id)
     
     @property
     @cache.update_on_key('user')
     def user(self):
         return User(self._cache['user']['screen_name'],
-            cache=self._cache['user'])
+            cache=self._cache['user'])._with_connection_broker(
+                self._connection_broker)
     
     @property
     @cache.update_on_key('source')
@@ -250,11 +180,171 @@ class Tweet(cache.CachedObject):
             '%a %b %d %H:%M:%S +0000 %Y').replace(tzinfo=pytz.utc)
     
     @property
-    @cache.update_once
+    @cache.update_on_key('in_reply_to_status_id')
     def in_reply_to(self):
         if not self._cache['in_reply_to_status_id']:
             return
-        return Tweet(self._cache['in_reply_to_status_id'])
+        cache = {'id': self._cache['in_reply_to_status_id']}
+        cache['user'] = {'id': self._cache['in_reply_to_user_id']}
+        return Tweet(self._cache['in_reply_to_status_id']
+            )._with_connection_broker(self._connection_broker)
     
+    id = cache.simple_map('id')
     text = cache.simple_map('text')
     truncated = cache.simple_map('truncated')
+
+
+class PublicTimeline(cache.ForwardCachedList):
+    
+    OBJ_CLASS = Tweet
+    UPDATE_INTERVAL = 60
+    
+    _sort_attrs = ('id',)
+    
+    def __len__(self):
+        return len(self._cache)
+    
+    def __repr__(self):
+        return 'PublicTimeline()'
+    
+    def _update_cache(self):
+        logger = log.getLogger('twactor.PublicTimeline.update')
+        logger.debug('Updating public timeline')
+        try:
+            return self._connection_broker.get('/statuses/public_timeline.json')
+        except Exception, exc:
+            # TODO: implement better error handling.
+            logger.error('Error fetching public timeline update')
+
+
+class UserTimeline(cache.ForwardCachedList):
+    
+    OBJ_CLASS = Tweet
+    
+    # Too low and we make too many API calls. Too high and it takes too long to
+    # fetch the data. 100 is a reasonable amount, which can be changed at any
+    # time by just setting the attribute.
+    _count = 100
+    
+    def __init__(self, *args, **kwargs):
+        user = None
+        if args:
+            user = args[0]
+        if not user:
+            user = User.me()
+        self.user = user
+    
+    def __getitem__(self, pos_or_slice):
+        new_timeline = super(UserTimeline, self).__getitem__(pos_or_slice)
+        if isinstance(new_timeline, UserTimeline):
+            new_timeline.user = self.user
+        return new_timeline
+    
+    def __len__(self):
+        return self.user._status_count
+    
+    def __repr__(self):
+        return 'UserTimeline(%r)' % (self.user,)
+    
+    def __str__(self):
+        return self.user.username.encode('utf-8')
+
+    def __unicode__(self):
+        return self.user.username
+    
+    def _copy(self):
+        copy = type(self)(self.user, cache=self._cache[:],
+            updated=self._updated.copy())
+        copy._connection_broker = self._connection_broker
+        return copy
+    
+    def _update_cache(self):
+        logger = log.getLogger('twactor.UserTimeline.update')
+        if ((time.time() - self._updated.get('__time', 0)) <
+            self.UPDATE_INTERVAL):
+            return []
+        logger.debug('Updating data for user %s' % (self.user.username,))
+        params = {'count': self._count}
+        if self._cache:
+            params['since_id'] = self._cache[-1]['id']
+        path = '/statuses/user_timeline/%s.json' % (self.user.username,)
+        try:
+            data = self._connection_broker.get(path, params=params)
+        except Exception, exc:
+            # TODO: implement better error handling.
+            logger.error('Error fetching user timeline update')
+        else:
+            logger.debug('Data for %s fetched' % (self.user.username,))
+            return data
+
+
+class UserHistory(cache.ReverseCachedList):
+    
+    OBJ_CLASS = Tweet
+    
+    # Too low and we make too many API calls. Too high and it takes too long to
+    # fetch the data. 100 is a reasonable amount, which can be changed at any
+    # time by just setting the attribute.
+    _count = 100
+    
+    def __init__(self, *args, **kwargs):
+        user = None
+        if args:
+            user = args[0]
+        if not user:
+            user = User.me()
+        elif isinstance(user, (basestring, int, long)):
+            user = User(user)
+        self.user = user
+        self._cache_page = kwargs.get('cache_page', 1)
+    
+    def __getitem__(self, pos_or_slice):
+        new_history = super(UserHistory, self).__getitem__(pos_or_slice)
+        if isinstance(new_history, UserHistory):
+            new_history.user = self.user
+        return new_history
+    
+    def __len__(self):
+        return self.user._status_count
+    
+    def __repr__(self):
+        return 'UserHistory(%r)' % (self.user,)
+    
+    def __str__(self):
+        return self.user.username.encode('utf-8')
+    
+    def __unicode__(self):
+        return self.user.username
+    
+    def _copy(self):
+        copy = type(self)(self.user, cache=self._cache[:],
+            updated=self._updated.copy())
+        copy._connection_broker = self._connection_broker
+        return copy
+    
+    def _update_cache(self):
+        logger = log.getLogger('twactor.UserHistory.update')
+        logger.debug('Updating data for user %s' % (self.user.username,))
+        path = '/statuses/user_timeline/%s.json' % (self.user.username,)
+        params = {'page': self._cache_page, 'count': self._count}
+        try:
+            data = self._connection_broker.get(path, params=params)
+        except Exception, exc:
+            # TODO: implement better error handling.
+            logger.error('Error fetching data')
+        else:
+            logger.debug('Data for %s fetched' % (self.user.username,))
+            self._cache_page += 1
+            return data
+
+
+class UserFollowers(cache.CachedObject):
+    pass # TODO: implement.
+
+
+class UserFollowing(cache.CachedObject):
+    pass # TODO: implement
+
+
+class UserDirectMessages(object):
+    pass # TODO: implement

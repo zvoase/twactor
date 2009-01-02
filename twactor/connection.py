@@ -1,4 +1,4 @@
-# Manages HTTP requests, responses and connections.
+# -*- coding: utf-8 -*-
 
 import httplib
 import re
@@ -7,8 +7,7 @@ import urllib
 import urllib2
 import urlparse
 
-from twactor import json
-from twactor.cache import propertyfix
+from twactor import json, propertyfix
 
 
 VALID_USERNAME_RE = re.compile(r'^[A-Za-z0-9_]+$')
@@ -28,9 +27,15 @@ def xunique(items, reverse=False):
             yield items[i]
         i += 1
 
-
 def unique(*args, **kwargs):
     return list(xunique(*args, **kwargs))
+
+def parse_content_type(content_type):
+    parts = content_type.split(';')
+    content_type, params = parts[0], parts[1:]
+    params = [map(urllib.url2pathname, map(str.strip, pair.split('=')))
+        for pair in params]
+    return content_type, dict(params)
 
 
 class ConnectionBroker(object):
@@ -61,7 +66,7 @@ class ConnectionBroker(object):
         def fset(self, value):
             if not VALID_USERNAME_RE.match(value):
                 raise ValueError('Invalid username: %r' % (value,))
-            self._username = username
+            self._username = value
             self._update()
         def fdel(self):
             self._username, self._password = None, None
@@ -75,7 +80,7 @@ class ConnectionBroker(object):
         def fset(self, value):
             if not VALID_PASSWORD_RE.match(value):
                 raise ValueError('Invalid password: %r' % (value,))
-            self._password = password
+            self._password = value
             self._update()
         def fdel(self):
             self._username, self._password = None, None
@@ -133,30 +138,31 @@ class ConnectionBroker(object):
         finally:
             connection.close()
     
-    def post(self, path, *args, **kwargs):
-        params, data = kwargs.pop('params', {}), kwargs.pop('data', {})
+    def post(self, path, params={}, data={}, content_type=''):
         # Deal with content type and POST data.
         if hasattr(data, '__iter__') and not isinstance(data, basestring):
             data = urllib.urlencode(data)
             content_type = 'application/x-www-form-urlencoded'
-        else:
-            content_type = kwargs.pop('content_type', None)
-        headers = kwargs.pop('headers', {})
+        headers = {}
         if content_type:
             headers['Content-Type'] = content_type
         # Using custom Request object.
         request = Request(self._build_url(path, params), data=data,
             headers=headers, method='POST')
-        connection = self._opener.open(request)
         try:
-            if 'json' in connection.info().dict['content-type']:
-                return json.load(connection)
+            connection = self._opener.open(request)
+            content_type, params = parse_content_type(
+                connection.info().dict.get('content-type', ''))
+            charset = params.get('charset', 'utf-8')
+            if content_type.endswith('json'):
+                return json.load(connection, encoding=charset)
             else:
-                return connection.read()
+                return connection.read().decode(charset)
         finally:
             connection.close()
     
-    def delete(self, path, params):
+    def delete(self, path, *args, **kwargs):
+        params = kwargs.pop('params', {})
         request = Request(self._build_url(path, params), method='DELETE')
         connection = self._opener.open(request)
         try:
@@ -170,13 +176,12 @@ class ConnectionBroker(object):
 
 class Request(urllib2.Request):
     
+    _set_method = False
+    _get_method = 'GET'
+    
     def __init__(self, *args, **kwargs):
         if 'method' in kwargs:
-            self._set_method = True
-            self._method = kwargs.pop('method')
-        else:
-            self._set_method = False
-            self._method = 'GET'
+            self.method = kwargs.pop('method')
         urllib2.Request.__init__(self, *args, **kwargs)
     
     @propertyfix
@@ -200,9 +205,17 @@ class Request(urllib2.Request):
             return 'GET'
 
 
+class TwitterErrorHandler(urllib2.BaseHandler):
+    
+    def http_error_default(request, fp, code, msg, hdrs):
+        raise exceptions.CODE_EXCEPTION_MAP.get(code, urllib2.HTTPError)(
+                request, fp, code, msg, hdrs)
+
+
 global DEFAULT_CB
 
 DEFAULT_CB = ConnectionBroker()
 
-def configure(*args, **kwargs):
-    DEFAULT_CB = ConnectionBroker(*args, **kwargs)
+def configure(username, password):
+    DEFAULT_CB.username = username
+    DEFAULT_CB.password = password
